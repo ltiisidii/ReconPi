@@ -100,16 +100,19 @@ gatherSubdomains() {
 	github-subdomains -t $github_subdomains_token -d "$domain" | sort -u >> "$SUBS"/github_subdomains.txt
 	echo -e "[$GREEN+$RESET] Done, next."
 
-	startFunction  rapiddns
+	startFunction "rapiddns"
 	crobat -s "$domain" | sort -u | tee "$SUBS"/rapiddns_subdomains.txt
 	echo -e "[$GREEN+$RESET] Done, next."
 
 	echo -e "[$GREEN+$RESET] Combining and sorting results.."
 	cat "$SUBS"/*.txt | sort -u >"$SUBS"/subdomains
-	echo -e "[$GREEN+$RESET] Resolving subdomains.."
-	cat "$SUBS"/subdomains | sort -u | shuffledns -silent -d "$domain" -r "$IPS"/resolvers.txt > "$SUBS"/alive_subdomains
-	echo -e "[$GREEN+$RESET] Getting alive hosts.."
-	cat "$SUBS"/alive_subdomains | "$HOME"/go/bin/httprobe -prefer-https | tee "$SUBS"/hosts
+
+	#echo -e "[$GREEN+$RESET] Resolving subdomains.." # skip for now, httpx will resolve?
+	#cat "$SUBS"/subdomains-enum | shuffledns -silent -d "$domain" -r "$IPS"/resolvers.txt > "$SUBS"/alive_subdomains
+	echo -e "[$GREEN+$RESET] Getting alive hosts.." # check this part (httpx?)
+	#new# maybe more ports with httpx?
+	httpx -l "$SUBS"/subdomains -silent -threads 9000 -timeout 30 | anew "$SUBS"/hosts
+	#old# cat "$SUBS"/alive_subdomains | "$HOME"/go/bin/httprobe -prefer-https | tee "$SUBS"/hosts
 	echo -e "[$GREEN+$RESET] Done."
 }
 
@@ -130,9 +133,9 @@ checkTakeovers() {
 		echo -e "[$GREEN+$RESET] No takeovers found."
 	fi
 
-	startFunction "nuclei to check takeover"
-	cat "$SUBS"/hosts | nuclei -t subdomain-takeover/ -c 50 -o "$SUBS"/nuclei-takeover-checks.txt
-	vulnto=$(cat "$SUBS"/nuclei-takeover-checks.txt)
+	startFunction "nuclei subdomain takeover check"
+	nuclei -l "$SUBS"/hosts -t takeovers/ -c 50 -o "$SUBS"/nuclei-takeover-checks.txt
+ 	vulnto=$(cat "$SUBS"/nuclei-takeover-checks.txt)
 	if [[ $vulnto != "" ]]; then
 		echo -e "[$GREEN+$RESET] Possible subdomain takeovers:"
 		for line in "$SUBS"/nuclei-takeover-checks.txt; do
@@ -160,22 +163,18 @@ gatherIPs() {
 : 'Portscan on found IP addresses'
 portScan() {
 	startFunction  "Port Scan"
-	cat "$SUBS"/alive_subdomains | naabu -p - -silent -no-probe -exclude-cdn -nmap -config "$HOME"/ReconPi/configs/naabu.conf
+	cd "$PORTSCAN" || return
+	cat "$IPS"/"$domain"-origin-ips.txt | naabu -p - -silent -exclude-cdn -nmap -config "$HOME"/ReconPi/configs/naabu.conf -o "$PORTSCAN"/naabu
     mv reconpi-nmap* "$PORTSCAN"
+	cd - || return
 	echo -e "[$GREEN+$RESET] Port Scan finished"
 }
 
 : 'Use eyewitness to gather screenshots'
 gatherScreenshots() {
-	startFunction "Screenshot Gathering"
-# Bug in aquatone, once it gets fixed, will enable aquatone on x86 also.
-	arch=`uname -m`
-	if [[ "$arch" == "x86_64" ]]; then
-        python3 $HOME/tools/EyeWitness/Python/EyeWitness.py -f "$SUBS"/hosts --no-prompt -d "$SCREENSHOTS"
-    else
-        "$HOME"/go/bin/aquatone -http-timeout 10000 -out "$SCREENSHOTS" <"$SUBS"/hosts
-    fi
-	echo -e "[$GREEN+$RESET] Screenshot Gathering finished"
+	startFunction "aquatone"
+    cat "$SUBS"/hosts | aquatone -http-timeout 10000 -ports xlarge -out "$SCREENSHOTS"
+	echo -e "[$GREEN+$RESET] Aquatone finished"
 }
 
 fetchArchive() {
@@ -197,12 +196,20 @@ fetchEndpoints() {
 	done
 	echo -e "[$GREEN+$RESET] fetchEndpoints finished"
 }
+
 : 'Gather information with meg'
 startMeg() {
 	startFunction "meg"
 	cd "$SUBS" || return
 	meg -d 1000 -v /
 	mv out meg
+	cd "$HOME" || return
+}
+
+: 'Check open redirects'
+startOpenRedirect() {
+	startFunction "gf open redirect"
+	cat "$SUBS"/hosts | waybackurls | httpx -silent -timeout 2 -threads 100 | gf redirect | anew "$RESULTDIR"/openredirects.txt 
 	cd "$HOME" || return
 }
 
@@ -221,28 +228,33 @@ startBruteForce() {
 	cat "$SUBS"/hosts | parallel -j 5 --bar --shuf gobuster dir -u {} -t 50 -w wordlist.txt -l -e -r -k -q -o "$DIRSCAN"/"$sub".txt
 	"$HOME"/go/bin/gobuster dir -u "$line" -w "$WORDLIST"/wordlist.txt -e -q -k -n -o "$DIRSCAN"/out.txt
 }
+
 : 'Check for Vulnerabilities'
 runNuclei() {
-	startFunction  "Nuclei Basic-detections"
-	nuclei -l "$SUBS"/hosts -t generic-detections/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/generic-detections.txt
-	startFunction  "Nuclei CVEs Detection"
+	startFunction  "Nuclei cves"
 	nuclei -l "$SUBS"/hosts -t cves/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/cve.txt
-	startFunction  "Nuclei default-creds Check"
-	nuclei -l "$SUBS"/hosts -t default-credentials/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/default-creds.txt
-	startFunction  "Nuclei dns check"
+	startFunction  "Nuclei default logins"
+	nuclei -l "$SUBS"/hosts -t default-logins/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/default-logins.txt
+	startFunction  "Nuclei dns"
 	nuclei -l "$SUBS"/hosts -t dns/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/dns.txt
-	startFunction  "Nuclei files check"
-	nuclei -l "$SUBS"/hosts -t files/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/files.txt
-	startFunction  "Nuclei Panels Check"
-	nuclei -l "$SUBS"/hosts -t panels/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/panels.txt
-	startFunction  "Nuclei Security-misconfiguration Check"
-	nuclei -l "$SUBS"/hosts -t security-misconfiguration/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/security-misconfiguration.txt
-	startFunction  "Nuclei Technologies Check"
+	startFunction  "Nuclei exposed panels"
+	nuclei -l "$SUBS"/hosts -t exposed-panels/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/exposed-panels.txt
+	startFunction  "Nuclei exposed tokens"
+	nuclei -l "$SUBS"/hosts -t exposed-tokens/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/exposed-tokens.txt
+	startFunction  "Nuclei exposures"
+	nuclei -l "$SUBS"/hosts -t exposures/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/exposures.txt	
+	startFunction  "Nuclei fuzzing"
+	nuclei -l "$SUBS"/hosts -t fuzzing/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/fuzzing.txt
+	startFunction  "Nuclei miscellaneous"
+	nuclei -l "$SUBS"/hosts -t miscellaneous/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/miscellaneous.txt
+	startFunction  "Nuclei misconfiguration"
+	nuclei -l "$SUBS"/hosts -t misconfiguration/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/misconfiguration.txt
+	startFunction  "Nuclei takeovers"
+	nuclei -l "$SUBS"/hosts -t takeovers/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/takeovers.txt
+	startFunction  "Nuclei technologies"
 	nuclei -l "$SUBS"/hosts -t technologies/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/technologies.txt
-	startFunction  "Nuclei Tokens Check"
-	nuclei -l "$SUBS"/hosts -t tokens/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/tokens.txt
-	startFunction  "Nuclei Vulnerabilties Check"
-	nuclei -l "$SUBS"/hosts -t vulnerabilities/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/vulnerabilties.txt
+	startFunction  "Nuclei vulnerabilities"
+	nuclei -l "$SUBS"/hosts -t vulnerabilities/ -c 50 -H "x-bug-bounty: $hackerhandle" -o "$NUCLEISCAN"/vulnerabilities.txt
 	echo -e "[$GREEN+$RESET] Nuclei Scan finished"
 }
 
@@ -348,7 +360,7 @@ startGfScan
 runNuclei
 portScan
 #makePage
-notifySlack
-notifyDiscord
+#notifySlack
+#notifyDiscord
 
 # Uncomment the functions
